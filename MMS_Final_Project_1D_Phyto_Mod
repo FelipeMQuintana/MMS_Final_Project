@@ -1,0 +1,538 @@
+---
+title: "MMS_Final_Project_1D_Phyto_Mod"
+author: "FelipeQuintana"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+```
+
+```{r}
+getwd()
+```
+
+```{r}
+###############################################################################
+# Heterosigma akashiwo: simple 1-D (time x depth) model with variable C:N:P
+# Template: Flynn (2001) J Plankton Res 23:977-997
+# Disclosure: Claude Sonnet 5.5 was used to write and debug portions of the
+# code contained in this model. All equations and values derived from publications
+# were manually double checked to ensure accuracy. 
+#
+# State variables (per layer, extensive, ug L-1):
+# B = biomass C            
+# Nq = cell N (= NC * B)      
+# Pq = cell P (= PC * B)
+# Chl = chlorophyll a (= ChlC * B)
+# A = ammonium N           
+# Pw = dissolved inorganic P   
+# DIC = dissolved inorganic C
+# Quotas NC, PC, ChlC (g g-1 C) are derived as Nq/B, Pq/B, Chl/B, so cellular
+# C:N:P varies freely (no fixed Redfield ratio).
+#
+# SIMPLIFICATIONS relative to Flynn (2001):
+#   - one N source (ammonium); no glutamine pool (GC) feedback -> replaced by a
+#     linear down-regulation of uptake as the quota approaches its maximum
+#   - one P quota (IPC + OPC merged); no Fe, Si or cell-size/division
+#   - daily-mean light (Flynn's allowed simplification: no dark reserves)
+#   - added (not in Flynn): linear mortality with full remineralization,
+#     vertical diffusion, optional swimming/sinking, a DIC limitation term
+# Values marked PLACEHOLDER are guesses to be replaced with H. akashiwo data.
+###############################################################################
+
+## ---- 1. Grid and time -----------------------------------------------------
+zmax <- 20; dz <- 1; nz <- zmax / dz
+z    <- seq(dz / 2, zmax - dz / 2, by = dz)      # layer midpoints (m)
+tmax <- 30                                       # run length (d)
+dt   <- 1 / 128                                  # time step (d), as in Flynn
+nt   <- round(tmax / dt)
+save_every <- 16                                 # save every 1/8 d
+
+
+```
+
+```{r}
+## ---- 2. Parameters --------------------------------------------------------
+# Growth / photosynthesis (Flynn 2001, Table III)
+Um     <- 1            # max growth rate (d-1); PLACEHOLDER for H. akashiwo
+alpha  <- 8e-6         # Chl-specific initial slope (per umol m-2 d-1 basis)
+ChlCm  <- 0.09         # max Chl:C (g Chl g-1 C)
+M      <- 2            # photoacclimation scalar
+basres <- 0.05 * Um    # basal respiration (d-1), simplified constant
+# Quotas (g g-1 C)
+NCm <- 0.15; NCo <- 0.05; NCk <- 1
+PCm <- 0.0235          # = IPCm + OPCm from Flyn Table III (Max P:C ratio) 
+PCo <- 0.005           # Miniumum P:C ratio threshold PLACEHOLDER
+PCk <- 0.009
+# Ammonium transport capacity, Flynn Eq. 2 (constants supplied)
+A1 <- -0.705; A2 <- 0.982; A3 <- -1.061; A4 <- 5.34
+# Environment / uptake constants (ug L-1)
+Akt   <- 14            # half-saturation, ammonium (ug N L-1), Flynn
+Pkt   <- 3             # PLACEHOLDER; half-saturation, phosphate (ug P L-1)
+Ptmax <- 4 * Um * 0.012  # max P uptake = 4 x Um x OPCm (Flynn)
+Kc    <- 600           # half-saturation, DIC (ug C L-1); PLACEHOLDER
+mort  <- 0.05          # mortality/grazing (d-1), remineralized; PLACEHOLDER
+# Light
+I0 <- 200              # daily-mean surface PFD (umol photons m-2 s-1)
+kw <- 0.1              # background attenuation (m-1); PLACEHOLDER
+kc <- 0.02             # Chl-specific attenuation (m2 mg-1 Chl); typical value
+# Physics
+Kz <- rep(1, nz - 1)   # eddy diffusivity at layer interfaces (m2 d-1)
+w  <- 0                # swimming speed, + = up (m d-1); 0 = off, PLACEHOLDER
+# Initial conditions
+B0 <- 5; NC0 <- 0.10; PC0 <- 0.012; ChlC0 <- 0.05
+A0 <- 5; P0 <- 0.5; DIC0 <- 24000
+
+# Injection (ug L-1), added to the layers listed at time t_inj
+t_inj <- 5
+inj_layers <- which(z <= 5)
+inj <- c(A = 140, P = 19, C = 800)    # ~10 uM N, ~0.6 uM P (N:P ~16), 66 uM C
+# Bloom definition
+bloom_thresh <- 10     # max Chl a in water column (ug L-1); arbitrary
+```
+
+```{r}
+## ---- 3. Functions ---------------------------------------------------------
+clamp01 <- function(x) pmin(1, pmax(0, x))
+
+# Equation 2: Maximum value of ammonnium transport with N status of cells
+# $A1 * (1 - exp^A2 * (1/NC - A4)) * exp^A3 * (1/NC - A4)$
+Atq <- function(NC) {                       # Flynn Eq. 2
+  x <- 1 / NC - A4
+  ifelse(x > 0, Um * A1 * (1 - exp(A2 * x)) * exp(A3 * x), 0)
+}
+
+# This equation describes growth rate relative to NC, given the quotent NCu. 
+# In some circumstances growth can exceed NCm(when growth is limtied by another)
+# nutrient, but NCu of course cannot exceed 1. 
+NCu <- function(NC) {                       # normalized N status (Eq. 8)
+  ifelse(NC >= NCm, 1,
+         pmax(0, NC - NCo) / (pmax(0, NC - NCo) + NCk) * (NCm - NCo + NCk) / (NCm - NCo))
+}
+
+# Normalized P quota regulatory parameter analogous to NCu. This is meant 
+# to turn the cell's phosphorus content into a 0-1 index of P status, called
+# PCu. This is what lets P limitation act on growth. PCo is the mimumum substance
+# quota, and PCm is the maximum quota, with PCk acting as the half saturation 
+# constant. 
+# 
+PCu <- function(PC) {                       # normalized P status (Eq. 28)
+  ifelse(PC >= PCm, 1,
+         pmax(0, PC - PCo) / (pmax(0, PC - PCo) + PCk) * (PCm - PCo + PCk) / (PCm - PCo))
+}
+
+NPCu <- function(Nu, Pu) {                  # N-P interaction (Eq. 29)
+  ifelse(Nu > Pu, Pu * (1 - Pu + Pu * Nu), Nu * (1 - Nu + Pu * Nu))
+}
+transport <- function(X, w = 0) {           # diffusion (+ upwind swimming)
+  Fi <- -Kz * (X[-1] - X[-nz]) / dz         # downward flux at interfaces
+  if (w != 0) Fi <- Fi - w * (if (w > 0) X[-1] else X[-nz])
+  Fl <- c(0, Fi, 0)                         # no flux at surface or bottom
+  -(Fl[-1] - Fl[-(nz + 1)]) / dz
+}
+
+```
+
+```{r}
+## ---- 4. Initialize --------------------------------------------------------
+# This step is mean to start the simulation and create placeholder matrixes
+# for the results to be stored in. This also calculates when nutrient 
+# injections occur as a time step. 
+
+B   <- rep(B0, nz); Nq <- NC0 * B; Pq <- PC0 * B; Chl <- ChlC0 * B 
+# Phytoplankton biomass as carbon (ug C/L)
+
+A   <- rep(A0, nz); Pw <- rep(P0, nz); DIC <- rep(DIC0, nz)
+# Dissolved ammonium nitrogen (ug N/L)
+
+nsave <- nt %/% save_every + 1 # How many snapshots will be saved
+t_out <- numeric(nsave) # Time of each "snapshot" of results
+mk <- function() matrix(NA_real_, nsave, nz) # Creating an empty matrix for results
+# to be filed in
+O <- list(B = mk(), Nq = mk(), Pq = mk(), Chl = mk(),
+          A = mk(), Pw = mk(), DIC = mk(), mu = mk(), PS = mk(), PFD = mk())
+Ntot <- Ptot <- Ctot <- numeric(nsave) # Stores the total mass of N, P, C at 
+# each saved time
+isave <- 0 # Counter for which snapshot row to write next
+inj_step <- round(t_inj / dt) + 1 # Injection step timing. 
+```
+
+```{r}
+## ---- 5. Time loop ---------------------------------------
+# This time loop step uses the explicit Euler equation 
+# where the new value = old value + time step * rate. With a timestep of 
+# dt = 1/128 per day, each step is about 11 minutes long. 
+for (step in 1:(nt + 1)) {
+  t <- (step - 1) * dt
+  if (step == inj_step) {                 # initial nutrient injection
+    A[inj_layers]   <- A[inj_layers]   + inj["A"]
+    Pw[inj_layers]  <- Pw[inj_layers]  + inj["P"]
+    DIC[inj_layers] <- DIC[inj_layers] + inj["C"]
+  }
+
+  Bs <- pmax(B, 1e-9) # Biomass as carbon 
+  NC <- Nq / Bs; PC <- Pq / Bs; ChlC <- Chl / Bs
+  Nu <- NCu(NC); Pu <- PCu(PC); NP <- NPCu(Nu, Pu)
+
+
+  # light with self-shading (Beer-Lambert, Chl in ug L-1 = mg m-3)
+  k   <- kw + kc * Chl
+  tau <- cumsum(k * dz) - k * dz / 2
+  PFD <- I0 * exp(-tau)
+
+  # photosynthesis production step (Jassby-Platt tanh, Flynn Eq. 20)
+  Pqm <- pmax((Um * (1 + 1.5 * NCm) + basres) * NP, 1e-9)
+  PS  <- Pqm * tanh(alpha * PFD * 86400 * ChlC / Pqm) * DIC / (DIC + Kc)
+
+  # nutrient uptake (g g-1 C d-1), capped so pools cannot go negative
+  At <- Atq(NC) * A / (A + Akt) * clamp01((NCm - NC) / (NCm - NCo))
+  Pt <- Ptmax * Pw / (Pw + Pkt) * clamp01((PCm - PC) / (PCm - PCo))
+  At <- pmin(At, A / (Bs * dt)); Pt <- pmin(Pt, Pw / (Bs * dt))
+
+  Cu  <- PS - 1.5 * At - basres             # C-specific growth (Eq. 21)
+  syn <- ChlCm * NP * M * Um * clamp01(1 - PS / Pqm) * clamp01(1 - ChlC / ChlCm)
+
+  # save
+  if ((step - 1) %% save_every == 0) {
+    isave <- isave + 1
+    t_out[isave] <- t
+    for (nm in c("B", "Nq", "Pq", "Chl", "A", "Pw", "DIC"))
+      O[[nm]][isave, ] <- get(nm)
+    O$mu[isave, ] <- Cu; O$PS[isave, ] <- PS; O$PFD[isave, ] <- PFD
+    Ntot[isave] <- sum(A + Nq) * dz
+    Ptot[isave] <- sum(Pw + Pq) * dz
+    Ctot[isave] <- sum(DIC + B) * dz
+  }
+  if (step > nt) break
+
+  # derivatives (extensive form; mortality is fully remineralized)
+  # When cells die, this ensures that the nutrients they uptook during their
+  # life is re-entered into the system so that everything remains constant. 
+  dB   <- B * (Cu - mort)       + transport(B, w)
+  dNq  <- At * B - mort * Nq    + transport(Nq, w)
+  dPq  <- Pt * B - mort * Pq    + transport(Pq, w)
+  dChl <- B * syn - mort * Chl  + transport(Chl, w)
+  dA   <- -At * B + mort * Nq   + transport(A)
+  dPw  <- -Pt * B + mort * Pq   + transport(Pw)
+  dDIC <- -Cu * B + mort * B    + transport(DIC)
+
+  B <- pmax(B + dt * dB, 0);     Nq <- pmax(Nq + dt * dNq, 0)
+  Pq <- pmax(Pq + dt * dPq, 0);  Chl <- pmax(Chl + dt * dChl, 0)
+  A <- pmax(A + dt * dA, 0);     Pw <- pmax(Pw + dt * dPw, 0)
+  DIC <- DIC + dt * dDIC
+}
+```
+
+```{r}
+## ---- 6. Diagnostics -------------------------------------------------------
+# Clarification: "d" is meant to represent the # of total days
+Btot    <- rowSums(O$B) * dz                    # Total biomass mg C m-2
+Chl_int <- rowSums(O$Chl) * dz                  # Chlorophyll intake mg Chl m-2
+Chl_max <- apply(O$Chl, 1, max)                 # Max chlorophyll value ug L-1
+NC_mean <- rowSums(O$Nq) / rowSums(O$B)       # avg N:C biomass-weighted quotas
+PC_mean <- rowSums(O$Pq) / rowSums(O$B)       # avg P:C biomass weighted quotas
+                                                # these quotas are referring to 
+                                                # the redfield ratio
+
+CN <- (1 / NC_mean) * 14 / 12                # molar ratios necessary for growth
+NP <- (NC_mean / PC_mean) * 31 / 14
+CP <- (1 / PC_mean) * 31 / 12
+Redfield <- c(CN = 106 / 16, NP = 16, CP = 106)
+
+r_net <- diff(log(Btot)) / diff(t_out)              # net population growth (d-1)
+above <- which(Chl_max >= bloom_thresh) # chlorophyll max must be greater than 
+                                        # bloom thresh hold in order for a 
+                                        # bloom to be counted. 
+# categorizing steps
+# just to clarify (d) is the time variable indicating fractions of one day
+cat("\n--- Bloom metrics (threshold =", bloom_thresh, "ug Chl L-1) ---\n")
+cat("Max net population growth rate (d-1):", round(max(r_net), 2), "\n")
+cat("Max specific growth rate Cu (d-1):   ", round(max(O$mu), 2), "\n")
+if (length(above) > 0) {
+  t_on <- t_out[min(above)]; t_off <- t_out[max(above)]
+  cat("Bloom onset (d):", t_on, " peak (d):", t_out[which.max(Chl_max)],
+      " end (d):", t_off, " residence (d):", t_off - t_on, "\n")
+} else cat("No bloom exceeded the threshold.\n")
+exp_N <- sum((A0 + NC0 * B0) * dz * rep(1, nz)) + ifelse(t_out >= t_inj, inj["A"] * length(inj_layers) * dz, 0)
+exp_P <- sum((P0 + PC0 * B0) * dz * rep(1, nz)) + ifelse(t_out >= t_inj, inj["P"] * length(inj_layers) * dz, 0)
+cat("Max N budget error (%):", signif(100 * max(abs(Ntot - exp_N) / exp_N), 2),
+    "| P:", signif(100 * max(abs(Ptot - exp_P) / exp_P), 2), "\n")
+```
+
+
+```{r}
+# ---- 7. Plots ---------------------------------------------------
+# Shared look for every panel (base_size 10 keeps six panels readable)
+theme_set(theme_bw(base_size = 10) +
+            theme(plot.title      = element_text(size = 9, face = "bold"),
+                  panel.grid.minor = element_blank(),
+                  legend.title     = element_blank(),   # legends are self-explanatory
+                  legend.position  = "bottom"))
+ 
+# ---- Panels 1 & 2: time x depth heatmaps ------------------------------------
+# O$Chl and O$mu are matrices (rows = time, columns = depth). as.vector() unrolls
+# them column by column, so time varies fastest -> time repeats "times = nz" and
+# depth repeats "each = length(t_out)" to line up with the unrolled values.
+grid_df <- data.frame(
+  time  = rep(t_out, times = nz),
+  depth = rep(z,     each  = length(t_out)),
+  Chl   = as.vector(O$Chl),
+  mu    = as.vector(O$mu)
+)
+
+# Setting palet 
+pal <- hcl.colors(50, "YlGnBu", rev = TRUE)
+ 
+p1 <- ggplot(grid_df, aes(time, depth, fill = Chl)) +
+  geom_raster() +                                   # one tile per (time, depth) cell
+  geom_vline(xintercept = t_inj, linetype = "dashed") +  # nutrient injection time
+  scale_fill_gradientn(colours = pal, name = "ug/L") +
+  scale_y_reverse(expand = c(0, 0)) +               # surface (0 m) at the top
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(title = "Chlorophyll a Concentration (ug/L)",
+       x = "Time (d)", y = "Depth (m)") +
+  theme(legend.position = "right")                  # colourbars read better on the side
+ 
+p2 <- ggplot(grid_df, aes(time, depth, fill = mu)) +
+  geom_raster() +
+  geom_vline(xintercept = t_inj, linetype = "dashed") +
+  scale_fill_viridis_c(name = "1/d") +              # matches hcl.colors("Viridis")
+  scale_y_reverse(expand = c(0, 0)) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(title = "Specific Growth Rate (1/d)",
+       x = "Time (d)", y = "Depth (m)") +
+  theme(legend.position = "right")
+ 
+# ---- Panel 3: depth-integrated Chl with shaded bloom window -----------------
+# To be clar the gray shaded area is the bloom period
+df3 <- data.frame(time = t_out, Chl_int = Chl_int)
+ 
+p3 <- ggplot(df3, aes(time, Chl_int))
+# Add the grey bloom rectangle FIRST so the line is drawn on top of it
+# (t_on / t_off only exist if a bloom happened, hence the length check)
+if (length(above) > 0) {
+  p3 <- p3 + annotate("rect", xmin = t_on, xmax = t_off,
+                      ymin = -Inf, ymax = Inf,      # -Inf/Inf = full panel height
+                      fill = "grey", alpha = 0.3)
+}
+p3 <- p3 +
+  geom_vline(xintercept = t_inj, linetype = "dashed") +
+  geom_line(linewidth = 1) +   # use size = 1 instead if your ggplot2 is older than 3.4.0
+  labs(title = "Depth-Integrated Chlorophyll a\nand Bloom",
+       x = "Time (d)", y = "Chlorophyll a (mg/m2)")
+ 
+# ---- Panel 4: water-column mean nutrients -----------------------------------
+df4 <- data.frame(time = t_out,
+                  `Ammonium N` = rowMeans(O$A),
+                  `Phosphate P` = rowMeans(O$Pw),
+                  check.names = FALSE) |>            # keep the spaces in the names
+  pivot_longer(-time, names_to = "nutrient", values_to = "conc")  # wide -> long for ggplot
+ 
+p4 <- ggplot(df4, aes(time, conc, colour = nutrient)) +
+  geom_line(linewidth = 1) +
+  scale_colour_manual(values = c("Ammonium N" = "firebrick",
+                                 "Phosphate P" = "steelblue")) +
+  labs(title = "Water Column Mean Nutrients",
+       x = "Time (d)", y = "Concentration (ug/L)")
+ 
+# ---- Panel 5: cellular C:N and N:P with Redfield reference lines ------------
+# Cellular ratios and Redfield values go in one long table. "type" drives the
+# linetype (solid = model, dotted = Redfield) and "ratio" drives the colour.
+df5 <- rbind(
+  data.frame(time = t_out, ratio = "C:N", type = "Cellular", value = CN),
+  data.frame(time = t_out, ratio = "N:P", type = "Cellular", value = NP),
+  data.frame(time = t_out, ratio = "C:N", type = "Redfield",
+             value = unname(Redfield["CN"])),        # constant across time
+  data.frame(time = t_out, ratio = "N:P", type = "Redfield",
+             value = unname(Redfield["NP"]))
+)
+ 
+p5 <- ggplot(df5, aes(time, value, colour = ratio, linetype = type)) +
+  geom_line(linewidth = 1) +
+  scale_colour_manual(values = c("C:N" = "darkgreen", "N:P" = "purple")) +
+  scale_linetype_manual(values = c(Cellular = "solid", Redfield = "dotted")) +
+  labs(title = "Cellular C:N and N:P Ratios",
+       x = "Time (d)", y = "Molar ratio")
+ 
+# ---- Panel 6: cellular C:P ---------------------------------------------------
+df6 <- data.frame(time = t_out, CP = CP)
+ 
+p6 <- ggplot(df6, aes(time, CP)) +
+  geom_hline(yintercept = Redfield["CP"], linetype = "dotted") +  # Redfield C:P = 106
+  geom_line(colour = "darkorange", linewidth = 1) +
+  labs(title = "Cellular C:P Ratio",
+       x = "Time (d)", y = "Molar C:P")
+ 
+# ---- Assemble and save -------------------------------------------------------
+# patchwork: wrap_plots() tiles the panels into a 2 x 3 grid (same as mfrow = c(2, 3))
+fig <- wrap_plots(p1, p2, p3, p4, p5, p6, ncol = 3)
+ 
+print(fig)   # shows in the Rmd / PDF output
+ 
+# Same pixel size as before: 1500 x 900 px at 130 dpi
+ggsave("heterosigma_1D_results_gg.png", fig,
+       width = 1500 / 130, height = 900 / 130, dpi = 130)
+cat("Saved heterosigma_1D_results_gg.png\n")
+```
+
+```{r}
+# Experimental Scenario
+run_scenario <- function(ov = list(), label = "base") {
+  # Save the current globals we might change, and restore them when the function ends
+  keep <- unique(c(names(ov), "basres", "Ptmax"))
+  old  <- mget(keep, envir = globalenv())
+  on.exit(list2env(old, envir = globalenv()), add = TRUE)
+  list2env(ov, envir = globalenv())   
+  # Listening to environment and apply overrides (e.g. list(I0 = 50))
+
+  # Derived parameters depend on Um, so recompute them unless set explicitly
+  if (!"basres" %in% names(ov)) assign("basres", 0.05 * Um, envir = globalenv())
+  if (!"Ptmax"  %in% names(ov)) assign("Ptmax", 4 * Um * 0.012, envir = globalenv())
+
+  # Quantities that depend on tmax, dt, t_inj are recomputed locally
+  nt <- round(tmax / dt); inj_step <- round(t_inj / dt) + 1
+  inj_layers <- which(z <= 5)
+
+  # Initial conditions (same as chunk 4)
+  B <- rep(B0, nz); Nq <- NC0 * B; Pq <- PC0 * B; Chl <- ChlC0 * B
+  A <- rep(A0, nz); Pw <- rep(P0, nz); DIC <- rep(DIC0, nz)
+
+  # Only store what the summary metrics need (not the full time x depth matrices)
+  nsave <- nt %/% save_every + 1
+  out <- data.frame(time = numeric(nsave), Chl_max = NA_real_, Chl_int = NA_real_,
+                    mu_max = NA_real_, NP_mol = NA_real_)
+  isave <- 0
+
+  for (step in 1:(nt + 1)) {
+    t <- (step - 1) * dt
+    if (step == inj_step) {                    # nutrient pulse
+      A[inj_layers]   <- A[inj_layers]   + inj["A"]
+      Pw[inj_layers]  <- Pw[inj_layers]  + inj["P"]
+      DIC[inj_layers] <- DIC[inj_layers] + inj["C"]
+    }
+    Bs <- pmax(B, 1e-9)
+    NC <- Nq / Bs; PC <- Pq / Bs; ChlC <- Chl / Bs    
+    # quotas derived from pools
+    Nu <- NCu(NC); Pu <- PCu(PC); NP <- NPCu(Nu, Pu)  
+    # NP here = NPCu (limitation index)
+
+    k   <- kw + kc * Chl                               
+    # light attenuation with self-shading
+    tau <- cumsum(k * dz) - k * dz / 2
+    PFD <- I0 * exp(-tau)
+
+    Pqm <- pmax((Um * (1 + 1.5 * NCm) + basres) * NP, 1e-9)
+    PS  <- Pqm * tanh(alpha * PFD * 86400 * ChlC / Pqm) * DIC / (DIC + Kc)
+
+    At <- Atq(NC) * A / (A + Akt) * clamp01((NCm - NC) / (NCm - NCo))
+    Pt <- Ptmax * Pw / (Pw + Pkt) * clamp01((PCm - PC) / (PCm - PCo))
+    At <- pmin(At, A / (Bs * dt)); Pt <- pmin(Pt, Pw / (Bs * dt))  
+    # pools can't go negative
+
+    Cu  <- PS - 1.5 * At - basres
+    syn <- ChlCm * NP * M * Um * clamp01(1 - PS / Pqm) * clamp01(1 - ChlC / ChlCm)
+
+    if ((step - 1) %% save_every == 0) {               
+      # record snapshot
+      isave <- isave + 1
+      out$time[isave]    <- t
+      out$Chl_max[isave] <- max(Chl)
+      out$Chl_int[isave] <- sum(Chl) * dz
+      out$mu_max[isave]  <- max(Cu)
+      out$NP_mol[isave]  <- (sum(Nq) / sum(Pq)) * 31 / 14   
+      # biomass-weighted cellular N:P
+    }
+    if (step > nt) break
+
+    dB   <- B * (Cu - mort)      + transport(B, w)
+    dNq  <- At * B - mort * Nq   + transport(Nq, w)
+    dPq  <- Pt * B - mort * Pq   + transport(Pq, w)
+    dChl <- B * syn - mort * Chl + transport(Chl, w)
+    dA   <- -At * B + mort * Nq  + transport(A)
+    dPw  <- -Pt * B + mort * Pq  + transport(Pw)
+    dDIC <- -Cu * B + mort * B   + transport(DIC)
+
+    B <- pmax(B + dt * dB, 0);    Nq <- pmax(Nq + dt * dNq, 0)
+    Pq <- pmax(Pq + dt * dPq, 0); Chl <- pmax(Chl + dt * dChl, 0)
+    A <- pmax(A + dt * dA, 0);    Pw <- pmax(Pw + dt * dPw, 0)
+    DIC <- DIC + dt * dDIC
+  }
+  out$label <- label
+  out
+}
+
+# Scenario list with treatments:
+# names are "group_value" so we can facet by group later 
+scen <- list(
+  base          = list(),
+  light_50      = list(I0 = 50),
+  light_100     = list(I0 = 100),
+  light_400     = list(I0 = 400),
+  turbid_0.4    = list(kw = 0.4),
+  Um_0.5        = list(Um = 0.5),
+  Um_1.5        = list(Um = 1.5),
+  pulse_half    = list(inj = c(A = 70,  P = 9.5, C = 800)),    
+  # half the nutrients, same N:P
+  pulse_double  = list(inj = c(A = 280, P = 38,  C = 800)),
+  NPratio_Plim  = list(inj = c(A = 140, P = 5,   C = 800)),    
+  # N:P ~ 60, should go P-limited
+  NPratio_Nlim  = list(inj = c(A = 40,  P = 19,  C = 800)),    
+  # N:P ~ 5, should go N-limited
+  
+  # Adjusting mortality scenarios
+  mort_0        = list(mort = 0),
+  mort_0.2      = list(mort = 0.2),
+  mix_0.1       = list(Kz = rep(0.1, nz - 1)),
+  mix_10        = list(Kz = rep(10,  nz - 1)),
+  mix_50        = list(Kz = rep(50,  nz - 1)),                 
+  # explicit-Euler limit is roughly Kz < 60
+  timing_10     = list(t_inj = 10),
+  Pkt_62        = list(Pkt = 62),                              
+  # Flynn's published value
+  swim_up2      = list(w = 2),                                 
+  # swimming up 2 m/d
+  # Extreme "does it break?" controls
+  ctrl_noinject = list(t_inj = 999),                           
+  # injection never happens
+  ctrl_dark     = list(I0 = 0)
+)
+
+res <- do.call(rbind, Map(run_scenario, scen, names(scen)))
+
+# ---- Bloom metrics per scenario ----
+summ <- do.call(rbind, lapply(split(res, res$label), function(d) {
+  above <- which(d$Chl_max >= bloom_thresh)                    
+  # same bloom definition as before
+  data.frame(label = d$label[1],
+             peak_Chl = round(max(d$Chl_max), 1),
+             t_peak   = d$time[which.max(d$Chl_max)],
+             onset    = if (length(above)) d$time[min(above)] else NA,
+             end      = if (length(above)) d$time[max(above)] else NA,
+             max_mu   = round(max(d$mu_max), 2),
+             NP_at_end = round(tail(d$NP_mol, 1), 1))
+}))
+print(summ, row.names = FALSE)
+
+# ---- Plot: each parameter group vs the base case ----
+res$group <- sub("_.*", "", res$label)
+base_df <- res[res$label == "base", ]
+plot_df <- do.call(rbind, lapply(setdiff(unique(res$group), "base"), function(g)
+  rbind(transform(base_df, group = g), res[res$group == g, ])))
+ggplot(plot_df, aes(time, Chl_int, colour = label)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = t_inj, linetype = "dashed") +
+  facet_wrap(~ group, scales = "free_y") +
+  labs(x = "Time (d)", y = "Depth-integrated Chl a (mg/m2)") +
+  theme_bw(base_size = 9)
+```
+
+
+
